@@ -195,6 +195,23 @@ The campaign tool verifies every target list with Listmonk before creating the
 campaign. Creating a campaign does not send it; `send_campaign` is a separate,
 explicit operation.
 
+## Recipient Estimates and Daily Send Limits
+
+These features need the KVSocial Listmonk fork (`KVSocial/listmonk`, branch
+`claude/changes` or later). On a stock Listmonk server the estimate is skipped
+and `daily_limit` is ignored.
+
+- `estimate_campaign_recipients(lists, daily_limit=0)` returns an approximate
+  recipient count for a set of list IDs, and how many days sending takes at a
+  given daily limit. The count comes from Listmonk's cached list stats, so a
+  subscriber on several lists is counted once per list (an upper bound).
+- `create_campaign` and `update_campaign` accept `daily_limit`: the maximum
+  e-mails sent per 24 hours (0 = no limit). When the limit is hit, sending
+  pauses and resumes at the same time the next day. A running campaign must be
+  paused before its limit can be changed.
+- `create_campaign` reports the estimate after creating the campaign, and
+  `get_campaign` shows the limit and how many were sent in the current window.
+
 `get_mailing_lists` supports `page`, `per_page` (default 100), `query`, and
 `status`. The configured Listmonk server controls any maximum. The response
 reports the API's total separately from the number of lists returned on the

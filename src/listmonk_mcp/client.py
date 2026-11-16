@@ -327,7 +327,8 @@ class ListmonkClient:
         content_type: str = "richtext",
         body: str | None = None,
         template_id: int | None = None,
-        tags: list[str] | None = None
+        tags: list[str] | None = None,
+        daily_limit: int | None = None
     ) -> dict[str, Any]:
         """Create a new campaign."""
         data: dict[str, Any] = {
@@ -343,6 +344,8 @@ class ListmonkClient:
             data["body"] = body
         if template_id:
             data["template_id"] = template_id
+        if daily_limit is not None:
+            data["daily_limit"] = daily_limit
 
         return await self._request("POST", "/api/campaigns", json_data=data)
 
@@ -353,7 +356,8 @@ class ListmonkClient:
         subject: str | None = None,
         lists: list[int] | None = None,
         body: str | None = None,
-        tags: list[str] | None = None
+        tags: list[str] | None = None,
+        daily_limit: int | None = None
     ) -> dict[str, Any]:
         """Update an existing campaign.
 
@@ -375,8 +379,17 @@ class ListmonkClient:
             data["body"] = body
         if tags is not None:
             data["tags"] = tags
+        if daily_limit is not None:
+            data["daily_limit"] = daily_limit
 
         return await self._request("PUT", f"/api/campaigns/{campaign_id}", json_data=data)
+
+    async def get_recipient_estimate(self, list_ids: list[int]) -> dict[str, Any]:
+        """Get the approximate recipient count for a set of lists.
+
+        Requires the KVSocial Listmonk fork (GET /api/campaigns/estimate).
+        """
+        return await self._request("GET", "/api/campaigns/estimate", params={"list_id": list_ids})
 
     async def send_campaign(self, campaign_id: int) -> dict[str, Any]:
         """Send a campaign immediately."""

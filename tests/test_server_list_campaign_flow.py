@@ -119,3 +119,71 @@ async def test_create_campaign_rejects_empty_or_invalid_targets(
     assert result == "Error: Mailing list IDs must be positive integers."
     assert fake.resolved_ids == []
     assert fake.campaign_request is None
+
+
+class EstimateClient(FakeClient):
+    def __init__(self, supports_estimate: bool = True) -> None:
+        super().__init__()
+        self.supports_estimate = supports_estimate
+        self.estimate_ids: list[int] | None = None
+
+    async def get_recipient_estimate(self, list_ids: list[int]) -> dict[str, object]:
+        if not self.supports_estimate:
+            raise RuntimeError("404")
+        self.estimate_ids = list_ids
+        return {"data": {"count": 5000}}
+
+
+@pytest.mark.asyncio
+async def test_create_campaign_passes_daily_limit_and_reports_estimate(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake = EstimateClient()
+    monkeypatch.setattr(server, "get_client", lambda: fake)
+
+    result = await server.create_campaign(
+        name="Daily", subject="Hi", lists=[7, 8], daily_limit=500
+    )
+
+    assert fake.campaign_request is not None
+    assert fake.campaign_request["daily_limit"] == 500
+    assert fake.estimate_ids == [7, 8]
+    assert "Approx. 5,000 recipients" in result
+    assert "about 10 day(s)" in result
+
+
+@pytest.mark.asyncio
+async def test_create_campaign_works_without_estimate_endpoint(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake = EstimateClient(supports_estimate=False)
+    monkeypatch.setattr(server, "get_client", lambda: fake)
+
+    result = await server.create_campaign(name="Daily", subject="Hi", lists=[7], daily_limit=500)
+
+    assert "Successfully created campaign" in result
+    assert "Daily limit: 500/day" in result
+
+
+@pytest.mark.asyncio
+async def test_create_campaign_rejects_negative_daily_limit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake = EstimateClient()
+    monkeypatch.setattr(server, "get_client", lambda: fake)
+
+    result = await server.create_campaign(name="X", subject="Hi", lists=[7], daily_limit=-1)
+
+    assert "daily_limit must be" in result
+    assert fake.campaign_request is None
+
+
+@pytest.mark.asyncio
+async def test_estimate_campaign_recipients(monkeypatch: pytest.MonkeyPatch) -> None:
+    fake = EstimateClient()
+    monkeypatch.setattr(server, "get_client", lambda: fake)
+
+    result = await server.estimate_campaign_recipients(lists=[1, 2, 3], daily_limit=1000)
+
+    assert fake.estimate_ids == [1, 2, 3]
+    assert result == "Approx. 5,000 recipients; at 1,000/day this takes about 5 day(s)"
