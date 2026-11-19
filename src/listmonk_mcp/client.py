@@ -384,12 +384,21 @@ class ListmonkClient:
 
         return await self._request("PUT", f"/api/campaigns/{campaign_id}", json_data=data)
 
-    async def get_recipient_estimate(self, list_ids: list[int]) -> dict[str, Any]:
+    async def get_recipient_estimate(
+        self, list_ids: list[int], campaign_type: str = "regular"
+    ) -> dict[str, Any]:
         """Get the approximate recipient count for a set of lists.
+
+        campaign_type is "regular" or "optin". Opt-in campaigns go to unconfirmed
+        subscribers, so they are counted differently.
 
         Requires the KVSocial Listmonk fork (GET /api/campaigns/estimate).
         """
-        return await self._request("GET", "/api/campaigns/estimate", params={"list_id": list_ids})
+        return await self._request(
+            "GET",
+            "/api/campaigns/estimate",
+            params={"list_id": list_ids, "type": campaign_type},
+        )
 
     async def send_campaign(self, campaign_id: int) -> dict[str, Any]:
         """Send a campaign immediately."""

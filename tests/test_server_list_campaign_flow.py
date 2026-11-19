@@ -126,11 +126,15 @@ class EstimateClient(FakeClient):
         super().__init__()
         self.supports_estimate = supports_estimate
         self.estimate_ids: list[int] | None = None
+        self.estimate_type: str | None = None
 
-    async def get_recipient_estimate(self, list_ids: list[int]) -> dict[str, object]:
+    async def get_recipient_estimate(
+        self, list_ids: list[int], campaign_type: str = "regular"
+    ) -> dict[str, object]:
         if not self.supports_estimate:
             raise RuntimeError("404")
         self.estimate_ids = list_ids
+        self.estimate_type = campaign_type
         return {"data": {"count": 5000}}
 
 
@@ -187,3 +191,139 @@ async def test_estimate_campaign_recipients(monkeypatch: pytest.MonkeyPatch) -> 
 
     assert fake.estimate_ids == [1, 2, 3]
     assert result == "Approx. 5,000 recipients; at 1,000/day this takes about 5 day(s)"
+
+
+@pytest.mark.asyncio
+async def test_create_campaign_estimates_with_campaign_type(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake = EstimateClient()
+    monkeypatch.setattr(server, "get_client", lambda: fake)
+
+    await server.create_campaign(name="Opt-in", subject="Confirm", lists=[7], type="optin")
+    assert fake.estimate_type == "optin"
+
+    await server.create_campaign(name="News", subject="Hi", lists=[7])
+    assert fake.estimate_type == "regular"
+
+
+@pytest.mark.asyncio
+async def test_estimate_campaign_recipients_passes_type(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake = EstimateClient()
+    monkeypatch.setattr(server, "get_client", lambda: fake)
+
+    await server.estimate_campaign_recipients(lists=[1], type="optin")
+    assert fake.estimate_type == "optin"
+
+    result = await server.estimate_campaign_recipients(lists=[1], type="weekly")
+    assert result == "Error: type must be 'regular' or 'optin'."
+
+
+@pytest.mark.asyncio
+async def test_client_sends_estimate_type(monkeypatch: pytest.MonkeyPatch) -> None:
+    from listmonk_mcp.client import ListmonkClient
+
+    calls: list[tuple[object, ...]] = []
+
+    async def fake_request(self: object, method: str, endpoint: str, params: object = None,
+                           json_data: object = None) -> dict[str, object]:
+        calls.append((method, endpoint, params))
+        return {"data": {"count": 3}}
+
+    monkeypatch.setattr(ListmonkClient, "_request", fake_request)
+    client = ListmonkClient.__new__(ListmonkClient)
+
+    await client.get_recipient_estimate([4, 5], "optin")
+
+    assert calls == [
+        ("GET", "/api/campaigns/estimate", {"list_id": [4, 5], "type": "optin"})
+    ]
+
+
+NOW = server.datetime(2026, 11, 19, 12, 0, tzinfo=server.UTC)
+
+
+@pytest.mark.parametrize(
+    ("campaign", "expected"),
+    [
+        ({"daily_limit": 0}, "none"),
+        ({"daily_limit": None}, "none"),
+        (
+            {"daily_limit": 500, "daily_sent": 0, "daily_window_start": None},
+            "500/day (0 sent in the current 24-hour window)",
+        ),
+        (
+            {
+                "status": "running",
+                "daily_limit": 500,
+                "daily_sent": 120,
+                "daily_window_start": "2026-11-19T06:00:00Z",
+            },
+            "500/day (120 sent in the current 24-hour window)",
+        ),
+        (
+            # Go's RFC 3339 output with nanoseconds and a local offset.
+            {
+                "status": "running",
+                "daily_limit": 500,
+                "daily_sent": 500,
+                "daily_window_start": "2026-11-19T11:45:00.123456789+05:45",
+            },
+            "500/day (500 sent in the current 24-hour window; limit reached, "
+            "the next window opens at 2026-11-20 06:00 UTC)",
+        ),
+        (
+            # The window has ended, so the stored count is from a past window.
+            {
+                "status": "paused",
+                "daily_limit": 500,
+                "daily_sent": 500,
+                "daily_window_start": "2026-11-18T11:00:00Z",
+            },
+            "500/day (0 sent in the current 24-hour window)",
+        ),
+        (
+            {
+                "status": "finished",
+                "daily_limit": 500,
+                "daily_sent": 500,
+                "daily_window_start": "2026-11-19T06:00:00Z",
+            },
+            "500/day (500 sent in the current 24-hour window)",
+        ),
+        (
+            {"daily_limit": 500, "daily_sent": 9, "daily_window_start": "not a date"},
+            "500/day (0 sent in the current 24-hour window)",
+        ),
+    ],
+)
+def test_daily_limit_summary(campaign: dict[str, object], expected: str) -> None:
+    assert server._daily_limit_summary(campaign, now=NOW) == expected
+
+
+@pytest.mark.asyncio
+async def test_get_campaign_shows_daily_limit_summary(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class CampaignClient(FakeClient):
+        async def get_campaign(self, campaign_id: int) -> dict[str, object]:
+            return {
+                "data": {
+                    "id": campaign_id,
+                    "name": "Daily",
+                    "status": "draft",
+                    "lists": [{"id": 7}],
+                    "daily_limit": 250,
+                    "daily_sent": 0,
+                    "daily_window_start": None,
+                    "body": "<p>x</p>",
+                }
+            }
+
+    monkeypatch.setattr(server, "get_client", lambda: CampaignClient())
+
+    result = await server.get_campaign(3)
+
+    assert "Daily Limit: 250/day (0 sent in the current 24-hour window)" in result
