@@ -195,6 +195,34 @@ The campaign tool verifies every target list with Listmonk before creating the
 campaign. Creating a campaign does not send it; `send_campaign` is a separate,
 explicit operation.
 
+## Recipient Estimates and Daily Send Limits
+
+These features need a KVSocial Listmonk release that includes
+[KVSocial/listmonk#9](https://github.com/KVSocial/listmonk/pull/9) (database
+migration `v6.2.1-kvs.3`). On a stock Listmonk server the estimate is skipped
+and `daily_limit` is ignored.
+
+- `estimate_campaign_recipients(lists, daily_limit=0, type="regular")` returns
+  an approximate recipient count for a set of list IDs, and how many days
+  sending takes at a given daily limit. The count comes from Listmonk's cached
+  list stats and follows the sending rules: unsubscribed and blocklisted
+  subscribers are excluded, and so are unconfirmed subscribers on double opt-in
+  lists. Pass `type="optin"` for opt-in campaigns, which go to unconfirmed
+  subscribers instead. A subscriber on several lists is counted once per list,
+  so treat it as an upper bound.
+- `create_campaign` and `update_campaign` accept `daily_limit`: the maximum
+  e-mails sent per 24 hours (0 = no limit). When the limit is hit, sending
+  waits for the rolling 24-hour window to end and then carries on where it
+  left off. A running campaign must be paused before its limit can be changed.
+  Leaving `daily_limit` out of an update keeps the current limit.
+- A campaign's audience is fixed when it starts sending, so its lists can't be
+  changed afterwards: Listmonk rejects the update. Clone the campaign to send
+  it to other lists.
+- `create_campaign` reports the estimate after creating the campaign, using
+  the campaign's type. `get_campaign` shows the limit, how many were sent in the
+  current 24-hour window, and when the next window opens once the limit is
+  reached.
+
 `get_mailing_lists` supports `page`, `per_page` (default 100), `query`, and
 `status`. The configured Listmonk server controls any maximum. The response
 reports the API's total separately from the number of lists returned on the

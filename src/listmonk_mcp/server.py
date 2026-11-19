@@ -1,7 +1,9 @@
 """Listmonk MCP Server using FastMCP framework."""
 
 import logging
+import re
 from contextlib import asynccontextmanager
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import typer
@@ -626,6 +628,7 @@ Status: {campaign.get('status')}
 Template ID: {campaign.get('template_id')}
 Lists: [{lists_str}]
 Content Type: {campaign.get('content_type', 'richtext')}
+Daily Limit: {_daily_limit_summary(campaign)}
 
 Body:
 {body}"""
@@ -642,7 +645,8 @@ async def create_campaign(
     content_type: str = "richtext",
     body: str | None = None,
     template_id: int | None = None,
-    tags: list[str] | None = None
+    tags: list[str] | None = None,
+    daily_limit: int = 0
 ) -> str:
     """
     Create a new email campaign.
@@ -656,6 +660,8 @@ async def create_campaign(
         body: Campaign content body
         template_id: Template ID to use (optional)
         tags: Campaign tags
+        daily_limit: Max e-mails to send per 24 hours (0 = no limit). When the limit
+            is hit, sending pauses and resumes at the same time the next day.
     """
     async def _create_campaign_logic() -> str:
         client = get_client()
@@ -666,6 +672,8 @@ async def create_campaign(
             return "Error: Mailing list IDs must be positive integers."
         if len(set(lists)) != len(lists):
             return "Error: Mailing list IDs must be unique."
+        if daily_limit < 0:
+            return "Error: daily_limit must be 0 (no limit) or a positive number."
 
         # Resolve each ID before creating anything so a stale or mistyped ID
         # cannot silently produce a campaign with the wrong audience.
@@ -685,7 +693,8 @@ async def create_campaign(
             content_type=content_type,
             body=body,
             template_id=template_id,
-            tags=tags or []
+            tags=tags or [],
+            daily_limit=daily_limit
         )
 
         campaign_data = result.get("data", {})
@@ -694,10 +703,16 @@ async def create_campaign(
             f"{target.get('name', 'Unnamed list')} (ID: {list_id})"
             for list_id, target in zip(lists, list_targets, strict=True)
         )
-        return (
+        message = (
             f"Successfully created campaign '{name}' (ID: {campaign_id}). "
             f"Target lists: {target_summary}"
         )
+        estimate = await _recipient_estimate(lists, type)
+        if estimate is not None:
+            message += f". {_format_estimate(estimate, daily_limit)}"
+        elif daily_limit:
+            message += f". Daily limit: {daily_limit:,}/day"
+        return message
 
     return await safe_execute_async(_create_campaign_logic)  # type: ignore[no-any-return]
 
@@ -709,7 +724,8 @@ async def update_campaign(
     subject: str | None = None,
     lists: list[int] | None = None,
     body: str | None = None,
-    tags: list[str] | None = None
+    tags: list[str] | None = None,
+    daily_limit: int | None = None
 ) -> str:
     """
     Update an existing campaign.
@@ -718,11 +734,19 @@ async def update_campaign(
         campaign_id: ID of the campaign to update
         name: New campaign name
         subject: New email subject
-        lists: New list of mailing list IDs
+        lists: New list of mailing list IDs. Lists can only change before a
+            campaign starts sending: once it has started, its audience is fixed
+            and Listmonk rejects list changes. Clone the campaign to send it to
+            other lists. Leave this out to keep the current lists.
         body: New campaign content
         tags: New campaign tags
+        daily_limit: Max e-mails to send per 24 hours (0 removes the limit).
+            Running campaigns must be paused before they can be edited. Leave
+            this out to keep the current limit.
     """
     async def _update_campaign_logic() -> str:
+        if daily_limit is not None and daily_limit < 0:
+            return "Error: daily_limit must be 0 (no limit) or a positive number."
         client = get_client()
         await client.update_campaign(
             campaign_id=campaign_id,
@@ -730,12 +754,100 @@ async def update_campaign(
             subject=subject,
             lists=lists,
             body=body,
-            tags=tags
+            tags=tags,
+            daily_limit=daily_limit
         )
 
         return f"Successfully updated campaign {campaign_id}"
 
     return await safe_execute_async(_update_campaign_logic)  # type: ignore[no-any-return]
+
+
+async def _recipient_estimate(
+    list_ids: list[int], campaign_type: str = "regular"
+) -> int | None:
+    """Return the approximate recipient count, or None if the server doesn't support it."""
+    try:
+        result = await get_client().get_recipient_estimate(list_ids, campaign_type)
+        return int(result.get("data", {}).get("count", 0))
+    except Exception:
+        return None
+
+
+def _parse_timestamp(value: Any) -> datetime | None:
+    """Parse a Listmonk timestamp (RFC 3339), or return None if it is missing or invalid."""
+    if not isinstance(value, str) or not value:
+        return None
+    # Keep at most microseconds, which is all datetime supports.
+    text = re.sub(r"(\.\d{6})\d+", r"\1", value.replace("Z", "+00:00"))
+    try:
+        parsed = datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    return parsed if parsed.tzinfo else parsed.replace(tzinfo=UTC)
+
+
+def _daily_limit_summary(campaign: dict[str, Any], now: datetime | None = None) -> str:
+    """Describe a campaign's daily limit and its current 24-hour window."""
+    limit = int(campaign.get("daily_limit") or 0)
+    if limit <= 0:
+        return "none"
+
+    now = now or datetime.now(UTC)
+    start = _parse_timestamp(campaign.get("daily_window_start"))
+    window_end = start + timedelta(hours=24) if start else None
+
+    # Listmonk only resets daily_sent at the first send after a window ends,
+    # so an expired window means nothing has been sent in the current one.
+    if window_end is None or now >= window_end:
+        return f"{limit:,}/day (0 sent in the current 24-hour window)"
+
+    sent = int(campaign.get("daily_sent") or 0)
+    text = f"{limit:,}/day ({sent:,} sent in the current 24-hour window"
+    if sent >= limit and campaign.get("status") in ("running", "paused"):
+        text += (
+            "; limit reached, the next window opens at "
+            f"{window_end.astimezone(UTC):%Y-%m-%d %H:%M} UTC"
+        )
+    return text + ")"
+
+
+def _format_estimate(count: int, daily_limit: int | None = None) -> str:
+    text = f"Approx. {count:,} recipients"
+    if daily_limit and count:
+        days = -(-count // daily_limit)
+        text += f"; at {daily_limit:,}/day this takes about {days} day(s)"
+    return text
+
+
+@mcp.tool()
+async def estimate_campaign_recipients(
+    lists: list[int], daily_limit: int = 0, type: str = "regular"
+) -> str:
+    """
+    Estimate how many contacts a campaign sent to these lists would reach.
+
+    The count comes from Listmonk's cached list stats and uses the same rules as
+    sending: unsubscribed and blocklisted subscribers are excluded, and so are
+    unconfirmed subscribers on double opt-in lists. Opt-in campaigns count only
+    unconfirmed subscribers on double opt-in lists instead. A subscriber on
+    several lists is counted once per list, so treat it as an upper bound.
+
+    Args:
+        lists: Mailing list IDs
+        daily_limit: Optional daily send limit, to estimate how many days sending takes
+        type: Campaign type (regular, optin)
+    """
+    async def _estimate_logic() -> str:
+        if not lists:
+            return "Error: At least one mailing list ID is required."
+        if type not in ("regular", "optin"):
+            return "Error: type must be 'regular' or 'optin'."
+        result = await get_client().get_recipient_estimate(lists, type)
+        count = int(result.get("data", {}).get("count", 0))
+        return _format_estimate(count, daily_limit)
+
+    return await safe_execute_async(_estimate_logic)  # type: ignore[no-any-return]
 
 
 @mcp.tool()
